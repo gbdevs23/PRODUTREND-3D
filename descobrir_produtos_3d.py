@@ -130,10 +130,11 @@ def main():
             vistos_hoje.add(chave)
             unicos_hoje.append(c)
 
-    # Separa o que é realmente NOVO em relação ao histórico
-    novos = [c for c in unicos_hoje if c['termo'].lower() not in ja_vistos]
-    for c in novos:
-        c['data'] = hoje
+    # Separa o que é realmente NOVO em relação ao histórico.
+    # Usa dict(c) pra criar uma CÓPIA — assim adicionar a coluna 'data' aqui
+    # não afeta os dicionários originais usados no snapshot do dia (que não
+    # tem essa coluna).
+    novos = [dict(c, data=hoje) for c in unicos_hoje if c['termo'].lower() not in ja_vistos]
 
     print(f"Candidatos imprimíveis em 3D hoje (após filtro): {len(unicos_hoje)}")
     print(f"Dos quais NOVOS (nunca vistos antes): {len(novos)}")
@@ -157,4 +158,5 @@ def main():
 
 
 if __name__ == '__main__':
+    main()
     main()
