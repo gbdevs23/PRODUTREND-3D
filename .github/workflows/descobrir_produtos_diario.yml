@@ -1,37 +1,161 @@
-name: Descobrir produtos 3D diariamente
+"""
+Descobridor diário de produtos imprimíveis em 3D.
 
-on:
-  schedule:
-    # 11:00 UTC = 08:00 horário de Brasília (UTC-3).
-    # Ajuste esse valor se quiser rodar em outro horário.
-    - cron: '0 11 * * *'
-  workflow_dispatch: {}  # também permite rodar manualmente pelo botão "Run workflow" no GitHub
+O QUE ELE FAZ:
+1. Puxa buscas em alta no Google Trends Brasil + "buscas relacionadas em
+   ascensão" para categorias-semente típicas de produto impresso em 3D
+   (organizadores, suportes, ganchos, vasos, brinquedos, chaveiros,
+   acessórios pet, itens de escritório, miniaturas etc).
+2. Filtra usando um dicionário de palavras que indicam "isso dá pra
+   imprimir em 3D" (peça rígida, pequena, plástica, decorativa ou
+   funcional) e EXCLUI o que normalmente não dá (eletrônicos com bateria,
+   líquidos, tecido, comida).
+3. Compara com o histórico (historico_candidatos.csv) pra marcar o que é
+   NOVO desde a última vez que rodou — assim, rodando 1x por dia, você só
+   presta atenção no que mudou.
+4. Acrescenta os novos ao histórico com a data do dia.
 
-permissions:
-  contents: write  # necessário para o workflow poder salvar (commitar) os resultados de volta no repositório
+PENSADO PRA RODAR SOZINHO TODO DIA (via cron/Agendador de Tarefas — veja
+o README para o passo a passo de agendamento). Não pede nada digitado,
+por isso não calcula custo/margem aqui — isso fica no segundo script
+(calcular_margem_3d.py), que você roda manualmente quando quiser avaliar
+um candidato específico.
+"""
 
-jobs:
-  descobrir:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Baixar o código do repositório
-        uses: actions/checkout@v4
+import csv
+import os
+import time
+from datetime import date
+from pytrends.request import TrendReq
 
-      - name: Configurar Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+ARQUIVO_HISTORICO = 'historico_candidatos.csv'
 
-      - name: Instalar dependências
-        run: pip install -r requirements.txt
+# Categorias-semente escolhidas por serem tipicamente imprimíveis em 3D
+CATEGORIAS_SEMENTE = [
+    "organizador de mesa", "suporte para celular", "porta-treco",
+    "gancho de parede", "vaso decorativo", "brinquedo educativo",
+    "acessórios para pet", "artigos de escritório", "utensílios de cozinha",
+    "chaveiro personalizado", "miniatura colecionável", "luminária decorativa",
+    "porta-controle remoto", "suporte de fone de ouvido", "cabideiro",
+]
 
-      - name: Rodar o descobridor de produtos 3D
-        run: python descobrir_produtos_3d.py
+# Palavras que indicam "peça rígida pequena, plausível de imprimir em 3D"
+PALAVRAS_IMPRIMIVEL = [
+    "suporte", "organizador", "porta-", "gancho", "vaso", "cabideiro",
+    "chaveiro", "miniatura", "action figure", "boneco", "quebra-cabeça",
+    "prendedor", "clipe", "case", "capa", "luminária", "porta-treco",
+    "porta-controle", "porta-copo", "porta-escova", "molde", "berço para",
+    "suporte de mesa", "suporte de parede", "brinquedo", "jogo de mesa",
+    "engrenagem", "peça decorativa", "enfeite", "topo de bolo",
+    "porta-joias", "organizador de cabos", "suporte para plantas",
+]
 
-      - name: Salvar resultados de volta no repositório
-        run: |
-          git config user.name "agente-produtos-3d"
-          git config user.email "actions@github.com"
-          git add historico_candidatos.csv candidatos_*.csv
-          git diff --staged --quiet || git commit -m "Descoberta automática de $(date -u +'%Y-%m-%d')"
-          git push
+# Palavras que descartam (produto não costuma ser 100% impresso em 3D)
+PALAVRAS_EXCLUIR = [
+    "bluetooth", "elétric", "bateria", "recarreg", "usb-c", "wifi",
+    "creme", "sérum", "óleo", "suplemento", "proteína", "shampoo",
+    "roupa", "camiseta", "tecido", "comida", "bebida", "perfume",
+    "morre", "resultado", "jogo do", "campeonato", "eleição", "novela",
+]
+
+
+def parece_imprimivel_3d(termo):
+    termo_lower = termo.lower()
+    if any(ruido in termo_lower for ruido in PALAVRAS_EXCLUIR):
+        return False
+    return any(palavra in termo_lower for palavra in PALAVRAS_IMPRIMIVEL)
+
+
+def carregar_historico():
+    if not os.path.exists(ARQUIVO_HISTORICO):
+        return set()
+    with open(ARQUIVO_HISTORICO, newline='', encoding='utf-8') as f:
+        leitor = csv.DictReader(f)
+        return {linha['termo'].lower() for linha in leitor}
+
+
+def salvar_no_historico(novos_candidatos):
+    arquivo_existe = os.path.exists(ARQUIVO_HISTORICO)
+    with open(ARQUIVO_HISTORICO, 'a', newline='', encoding='utf-8') as f:
+        campos = ['data', 'termo', 'categoria_semente', 'tipo_sinal']
+        escritor = csv.DictWriter(f, fieldnames=campos)
+        if not arquivo_existe:
+            escritor.writeheader()
+        escritor.writerows(novos_candidatos)
+
+
+def pegar_rising_por_categoria(pytrends, categoria):
+    candidatos = []
+    try:
+        pytrends.build_payload([categoria], timeframe='today 1-m', geo='BR')
+        relacionadas = pytrends.related_queries()
+        rising = relacionadas.get(categoria, {}).get('rising')
+        if rising is not None and not rising.empty:
+            for _, linha in rising.iterrows():
+                valor = linha['value']
+                tipo_sinal = f"rising ({valor}%)" if isinstance(valor, (int, float)) else 'rising'
+                candidatos.append({
+                    'termo': linha['query'],
+                    'categoria_semente': categoria,
+                    'tipo_sinal': tipo_sinal,
+                })
+    except Exception as e:
+        print(f"  [aviso] não consegui pegar rising de '{categoria}': {e}")
+    return candidatos
+
+
+def main():
+    pytrends = TrendReq(hl='pt-BR', tz=180)
+    hoje = date.today().isoformat()
+
+    ja_vistos = carregar_historico()
+    print(f"Termos já no histórico: {len(ja_vistos)}")
+
+    todos_candidatos = []
+    for categoria in CATEGORIAS_SEMENTE:
+        print(f"Consultando categoria: {categoria}...")
+        todos_candidatos += pegar_rising_por_categoria(pytrends, categoria)
+        time.sleep(2)  # evita bloqueio por excesso de requisições
+
+    print(f"\nTotal bruto coletado hoje: {len(todos_candidatos)}")
+
+    filtrados = [c for c in todos_candidatos if parece_imprimivel_3d(c['termo'])]
+
+    # Remove duplicados dentro da própria coleta de hoje
+    vistos_hoje = set()
+    unicos_hoje = []
+    for c in filtrados:
+        chave = c['termo'].lower()
+        if chave not in vistos_hoje:
+            vistos_hoje.add(chave)
+            unicos_hoje.append(c)
+
+    # Separa o que é realmente NOVO em relação ao histórico.
+    # Usa dict(c) pra criar uma CÓPIA — assim adicionar a coluna 'data' aqui
+    # não afeta os dicionários originais usados no snapshot do dia (que não
+    # tem essa coluna).
+    novos = [dict(c, data=hoje) for c in unicos_hoje if c['termo'].lower() not in ja_vistos]
+
+    print(f"Candidatos imprimíveis em 3D hoje (após filtro): {len(unicos_hoje)}")
+    print(f"Dos quais NOVOS (nunca vistos antes): {len(novos)}")
+
+    if novos:
+        salvar_no_historico(novos)
+        print(f"\n{len(novos)} novos candidatos adicionados a {ARQUIVO_HISTORICO}:")
+        for c in novos:
+            print(f"  - {c['termo']}  (semente: {c['categoria_semente']}, sinal: {c['tipo_sinal']})")
+    else:
+        print("\nNenhum candidato novo hoje. Nada foi adicionado ao histórico.")
+
+    # Também salva um snapshot do dia (útil pra rodar calcular_margem_3d.py)
+    arquivo_do_dia = f'candidatos_{hoje}.csv'
+    with open(arquivo_do_dia, 'w', newline='', encoding='utf-8') as f:
+        campos = ['termo', 'categoria_semente', 'tipo_sinal']
+        escritor = csv.DictWriter(f, fieldnames=campos)
+        escritor.writeheader()
+        escritor.writerows(unicos_hoje)
+    print(f"\nSnapshot completo de hoje salvo em {arquivo_do_dia}")
+
+
+if __name__ == '__main__':
+    main()
